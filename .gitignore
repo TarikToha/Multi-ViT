@@ -139,8 +139,31 @@ dmypy.json
 # Cython debug symbols
 cython_debug/
 
-!/checkpoint/
-!/data/
-!/logs/
-!/output/
-.idea
+.idea/
+apex/
+checkpoint/
+data/
+logs/
+wandb/
+output/
+viz/
+
+user*
+case*
+factors*
+conditional*
+pix2mm/
+
+overall*
+clothes*
+environments*
+intrusion*
+pose*
+wall*
+
+*.ipynb
+*.out
+*.sh
+*.c
+*.csv
+*.png

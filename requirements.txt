@@ -1,5 +1,6 @@
-torch
-numpy
-tqdm
-tensorboard
 ml-collections
+numpy
+torch
+tqdm
+wandb
+zstandard

@@ -1,29 +1,20 @@
-# coding=utf-8
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import copy
 import logging
 import math
-
 from os.path import join as pjoin
 
+import numpy as np
 import torch
 import torch.nn as nn
-import numpy as np
-
-from torch.nn import CrossEntropyLoss, Dropout, Softmax, Linear, Conv2d, LayerNorm
-from torch.nn.modules.utils import _pair
 from scipy import ndimage
+from torch.nn import CrossEntropyLoss, Dropout, Softmax, Linear, Conv2d, LayerNorm, L1Loss, MSELoss
+from torch.nn.functional import relu, pairwise_distance
+from torch.nn.modules.utils import _pair
 
 import models.configs as configs
-
 from .modeling_resnet import ResNetV2
 
-
 logger = logging.getLogger(__name__)
-
 
 ATTENTION_Q = "MultiHeadDotProductAttention_1/query"
 ATTENTION_K = "MultiHeadDotProductAttention_1/key"
@@ -124,6 +115,7 @@ class Mlp(nn.Module):
 class Embeddings(nn.Module):
     """Construct the embeddings from patch, position embeddings.
     """
+
     def __init__(self, config, img_size, in_channels=3):
         super(Embeddings, self).__init__()
         self.hybrid = None
@@ -143,11 +135,12 @@ class Embeddings(nn.Module):
             self.hybrid_model = ResNetV2(block_units=config.resnet.num_layers,
                                          width_factor=config.resnet.width_factor)
             in_channels = self.hybrid_model.width * 16
+
         self.patch_embeddings = Conv2d(in_channels=in_channels,
                                        out_channels=config.hidden_size,
                                        kernel_size=patch_size,
                                        stride=patch_size)
-        self.position_embeddings = nn.Parameter(torch.zeros(1, n_patches+1, config.hidden_size))
+        self.position_embeddings = nn.Parameter(torch.zeros(1, n_patches + 1, config.hidden_size))
         self.cls_token = nn.Parameter(torch.zeros(1, 1, config.hidden_size))
 
         self.dropout = Dropout(config.transformer["dropout_rate"])
@@ -158,6 +151,7 @@ class Embeddings(nn.Module):
 
         if self.hybrid:
             x = self.hybrid_model(x)
+
         x = self.patch_embeddings(x)
         x = x.flatten(2)
         x = x.transpose(-1, -2)
@@ -192,10 +186,13 @@ class Block(nn.Module):
     def load_from(self, weights, n_block):
         ROOT = f"Transformer/encoderblock_{n_block}"
         with torch.no_grad():
-            query_weight = np2th(weights[pjoin(ROOT, ATTENTION_Q, "kernel")]).view(self.hidden_size, self.hidden_size).t()
+            query_weight = np2th(weights[pjoin(ROOT, ATTENTION_Q, "kernel")]).view(self.hidden_size,
+                                                                                   self.hidden_size).t()
             key_weight = np2th(weights[pjoin(ROOT, ATTENTION_K, "kernel")]).view(self.hidden_size, self.hidden_size).t()
-            value_weight = np2th(weights[pjoin(ROOT, ATTENTION_V, "kernel")]).view(self.hidden_size, self.hidden_size).t()
-            out_weight = np2th(weights[pjoin(ROOT, ATTENTION_OUT, "kernel")]).view(self.hidden_size, self.hidden_size).t()
+            value_weight = np2th(weights[pjoin(ROOT, ATTENTION_V, "kernel")]).view(self.hidden_size,
+                                                                                   self.hidden_size).t()
+            out_weight = np2th(weights[pjoin(ROOT, ATTENTION_OUT, "kernel")]).view(self.hidden_size,
+                                                                                   self.hidden_size).t()
 
             query_bias = np2th(weights[pjoin(ROOT, ATTENTION_Q, "bias")]).view(-1)
             key_bias = np2th(weights[pjoin(ROOT, ATTENTION_K, "bias")]).view(-1)
@@ -269,22 +266,24 @@ class VisionTransformer(nn.Module):
         self.transformer = Transformer(config, img_size, vis)
         self.head = Linear(config.hidden_size, num_classes)
 
+        self.cls_loss = CrossEntropyLoss()
+
     def forward(self, x, labels=None):
-        x, attn_weights = self.transformer(x)
+        x, _ = self.transformer(x)
         logits = self.head(x[:, 0])
 
         if labels is not None:
-            loss_fct = CrossEntropyLoss()
-            loss = loss_fct(logits.view(-1, self.num_classes), labels.view(-1))
-            return loss
+            loss = self.cls_loss(logits.view(-1, self.num_classes), labels.view(-1))
+            return loss, logits
         else:
-            return logits, attn_weights
+            return logits
 
     def load_from(self, weights):
         with torch.no_grad():
             if self.zero_head:
                 nn.init.zeros_(self.head.weight)
                 nn.init.zeros_(self.head.bias)
+                logger.info("head is initialized with zero")
             else:
                 self.head.weight.copy_(np2th(weights["head/kernel"]).t())
                 self.head.bias.copy_(np2th(weights["head/bias"]).t())
@@ -299,6 +298,7 @@ class VisionTransformer(nn.Module):
             posemb_new = self.transformer.embeddings.position_embeddings
             if posemb.size() == posemb_new.size():
                 self.transformer.embeddings.position_embeddings.copy_(posemb)
+                logger.info(f'load_pretrained: {posemb.shape}')
             else:
                 logger.info("load_pretrained: resized variant: %s to %s" % (posemb.size(), posemb_new.size()))
                 ntok_new = posemb_new.size(1)
@@ -324,8 +324,11 @@ class VisionTransformer(nn.Module):
                 for uname, unit in block.named_children():
                     unit.load_from(weights, n_block=uname)
 
+            logger.info("regular model is loaded")
+
             if self.transformer.embeddings.hybrid:
-                self.transformer.embeddings.hybrid_model.root.conv.weight.copy_(np2th(weights["conv_root/kernel"], conv=True))
+                self.transformer.embeddings.hybrid_model.root.conv.weight.copy_(
+                    np2th(weights["conv_root/kernel"], conv=True))
                 gn_weight = np2th(weights["gn_root/scale"]).view(-1)
                 gn_bias = np2th(weights["gn_root/bias"]).view(-1)
                 self.transformer.embeddings.hybrid_model.root.gn.weight.copy_(gn_weight)
@@ -335,6 +338,493 @@ class VisionTransformer(nn.Module):
                     for uname, unit in block.named_children():
                         unit.load_from(weights, n_block=bname, n_unit=uname)
 
+                logger.info("hybrid model is loaded")
+
+
+class BiVisionTransformer(nn.Module):
+    def __init__(self, config, img_size=224, num_classes=21843, zero_head=False, vis=False):
+        super(BiVisionTransformer, self).__init__()
+        self.num_classes = num_classes
+        self.zero_head = zero_head
+        self.classifier = config.classifier
+
+        self.transformer1 = Transformer(config, img_size, vis)
+        self.transformer2 = Transformer(config, img_size, vis)
+
+        self.neck = Linear(config.hidden_size * 2, config.hidden_size)
+        self.head = Linear(config.hidden_size, num_classes)
+
+        self.cls_loss = CrossEntropyLoss()
+
+    def forward(self, x1, x2, labels=None):
+        x1, _ = self.transformer1(x1)
+        x2, _ = self.transformer2(x2)
+
+        x = torch.cat((x1[:, 0], x2[:, 0]), dim=-1)
+        x = self.neck(x)
+
+        logits = self.head(x)
+
+        if labels is not None:
+            loss = self.cls_loss(logits.view(-1, self.num_classes), labels.view(-1))
+            return loss, logits
+        else:
+            return logits
+
+    def load_from(self, weights):
+        with torch.no_grad():
+            if self.zero_head:
+                nn.init.zeros_(self.head.weight)
+                nn.init.zeros_(self.head.bias)
+                logger.info("head is initialized with zero")
+            else:
+                self.head.weight.copy_(np2th(weights["head/kernel"]).t())
+                self.head.bias.copy_(np2th(weights["head/bias"]).t())
+
+        self.load_weights1(weights=weights)
+        self.load_weights2(weights=weights)
+
+    def load_weights1(self, weights):
+        with torch.no_grad():
+            self.transformer1.embeddings.patch_embeddings.weight.copy_(np2th(weights["embedding/kernel"], conv=True))
+            self.transformer1.embeddings.patch_embeddings.bias.copy_(np2th(weights["embedding/bias"]))
+            self.transformer1.embeddings.cls_token.copy_(np2th(weights["cls"]))
+            self.transformer1.encoder.encoder_norm.weight.copy_(np2th(weights["Transformer/encoder_norm/scale"]))
+            self.transformer1.encoder.encoder_norm.bias.copy_(np2th(weights["Transformer/encoder_norm/bias"]))
+
+            posemb = np2th(weights["Transformer/posembed_input/pos_embedding"])
+            posemb_new = self.transformer1.embeddings.position_embeddings
+            if posemb.size() == posemb_new.size():
+                self.transformer1.embeddings.position_embeddings.copy_(posemb)
+                logger.info(f'load_pretrained: transformer1: {posemb.shape}')
+            else:
+                logger.info("load_pretrained: resized variant: %s to %s" % (posemb.size(), posemb_new.size()))
+                ntok_new = posemb_new.size(1)
+
+                if self.classifier == "token":
+                    posemb_tok, posemb_grid = posemb[:, :1], posemb[0, 1:]
+                    ntok_new -= 1
+                else:
+                    posemb_tok, posemb_grid = posemb[:, :0], posemb[0]
+
+                gs_old = int(np.sqrt(len(posemb_grid)))
+                gs_new = int(np.sqrt(ntok_new))
+                print('load_pretrained: grid-size from %s to %s' % (gs_old, gs_new))
+                posemb_grid = posemb_grid.reshape(gs_old, gs_old, -1)
+
+                zoom = (gs_new / gs_old, gs_new / gs_old, 1)
+                posemb_grid = ndimage.zoom(posemb_grid, zoom, order=1)
+                posemb_grid = posemb_grid.reshape(1, gs_new * gs_new, -1)
+                posemb = np.concatenate([posemb_tok, posemb_grid], axis=1)
+                self.transformer1.embeddings.position_embeddings.copy_(np2th(posemb))
+
+            for bname, block in self.transformer1.encoder.named_children():
+                for uname, unit in block.named_children():
+                    unit.load_from(weights, n_block=uname)
+            logger.info("regular model is loaded in transformer1")
+
+            if self.transformer1.embeddings.hybrid:
+                self.transformer1.embeddings.hybrid_model.root.conv.weight.copy_(
+                    np2th(weights["conv_root/kernel"], conv=True))
+                gn_weight = np2th(weights["gn_root/scale"]).view(-1)
+                gn_bias = np2th(weights["gn_root/bias"]).view(-1)
+                self.transformer1.embeddings.hybrid_model.root.gn.weight.copy_(gn_weight)
+                self.transformer1.embeddings.hybrid_model.root.gn.bias.copy_(gn_bias)
+
+                for bname, block in self.transformer1.embeddings.hybrid_model.body.named_children():
+                    for uname, unit in block.named_children():
+                        unit.load_from(weights, n_block=bname, n_unit=uname)
+                logger.info("hybrid model is loaded in transformer1")
+
+    def load_weights2(self, weights):
+        with torch.no_grad():
+            self.transformer2.embeddings.patch_embeddings.weight.copy_(np2th(weights["embedding/kernel"], conv=True))
+            self.transformer2.embeddings.patch_embeddings.bias.copy_(np2th(weights["embedding/bias"]))
+            self.transformer2.embeddings.cls_token.copy_(np2th(weights["cls"]))
+            self.transformer2.encoder.encoder_norm.weight.copy_(np2th(weights["Transformer/encoder_norm/scale"]))
+            self.transformer2.encoder.encoder_norm.bias.copy_(np2th(weights["Transformer/encoder_norm/bias"]))
+
+            posemb = np2th(weights["Transformer/posembed_input/pos_embedding"])
+            posemb_new = self.transformer2.embeddings.position_embeddings
+            if posemb.size() == posemb_new.size():
+                self.transformer2.embeddings.position_embeddings.copy_(posemb)
+                logger.info(f'load_pretrained: transformer2: {posemb.shape}')
+            else:
+                logger.info("load_pretrained: resized variant: %s to %s" % (posemb.size(), posemb_new.size()))
+                ntok_new = posemb_new.size(1)
+
+                if self.classifier == "token":
+                    posemb_tok, posemb_grid = posemb[:, :1], posemb[0, 1:]
+                    ntok_new -= 1
+                else:
+                    posemb_tok, posemb_grid = posemb[:, :0], posemb[0]
+
+                gs_old = int(np.sqrt(len(posemb_grid)))
+                gs_new = int(np.sqrt(ntok_new))
+                print('load_pretrained: grid-size from %s to %s' % (gs_old, gs_new))
+                posemb_grid = posemb_grid.reshape(gs_old, gs_old, -1)
+
+                zoom = (gs_new / gs_old, gs_new / gs_old, 1)
+                posemb_grid = ndimage.zoom(posemb_grid, zoom, order=1)
+                posemb_grid = posemb_grid.reshape(1, gs_new * gs_new, -1)
+                posemb = np.concatenate([posemb_tok, posemb_grid], axis=1)
+                self.transformer2.embeddings.position_embeddings.copy_(np2th(posemb))
+
+            for bname, block in self.transformer2.encoder.named_children():
+                for uname, unit in block.named_children():
+                    unit.load_from(weights, n_block=uname)
+            logger.info("regular model is loaded in transformer2")
+
+            if self.transformer2.embeddings.hybrid:
+                self.transformer2.embeddings.hybrid_model.root.conv.weight.copy_(
+                    np2th(weights["conv_root/kernel"], conv=True))
+                gn_weight = np2th(weights["gn_root/scale"]).view(-1)
+                gn_bias = np2th(weights["gn_root/bias"]).view(-1)
+                self.transformer2.embeddings.hybrid_model.root.gn.weight.copy_(gn_weight)
+                self.transformer2.embeddings.hybrid_model.root.gn.bias.copy_(gn_bias)
+
+                for bname, block in self.transformer2.embeddings.hybrid_model.body.named_children():
+                    for uname, unit in block.named_children():
+                        unit.load_from(weights, n_block=bname, n_unit=uname)
+                logger.info("hybrid model is loaded in transformer2")
+
+
+class SiVisionTransformer(nn.Module):
+    def __init__(self, config, res_type, img_size=224, num_classes=21843,
+                 zero_head=False, vis=False):
+        super(SiVisionTransformer, self).__init__()
+        self.num_classes = num_classes
+        self.zero_head = zero_head
+        self.classifier = config.classifier
+
+        self.transformer1 = Transformer(config, img_size, vis)
+        self.transformer2 = Transformer(config, img_size, vis)
+
+        self.neck = Linear(config.hidden_size * 2, config.hidden_size)
+        self.head = Linear(config.hidden_size, num_classes)
+
+        self.cls_loss = CrossEntropyLoss()
+        self.mae_loss = L1Loss()
+        self.mse_loss = MSELoss()
+        self.res_type = res_type
+        print(f'using {res_type} loss')
+
+    def forward(self, x1, x2, labels=None):
+        x1, _ = self.transformer1(x1)
+        x2, _ = self.transformer2(x2)
+
+        x1, x2 = x1[:, 0], x2[:, 0]
+        x = torch.cat((x1, x2), dim=-1)
+        x = self.neck(x)
+        logits = self.head(x)
+
+        if labels is not None:
+            cls_loss = self.cls_loss(logits.view(-1, self.num_classes), labels.view(-1))
+
+            if self.res_type == 'con_mse_ad':
+                res_loss = self.contrastive_mse_ad(x1, x2, labels)
+            elif self.res_type == 'ad_con_mse_mae':
+                res_loss = self.contrastive_mse_ad(x1, x2, labels) + self.mae_loss(x1, x2)
+            elif self.res_type == 'mae':
+                res_loss = self.mae_loss(x1, x2)
+            elif self.res_type == 'mse':
+                res_loss = self.mse_loss(x1, x2)
+            else:
+                print(f'{self.res_type} loss is not defined')
+                exit()
+
+            loss = cls_loss + 2 * res_loss
+            return loss, logits
+        else:
+            return logits
+
+    def contrastive_mse_ad(self, x1, x2, y):
+        labels = (y != 4).float()
+        distance = pairwise_distance(x1, x2, keepdim=True)
+        margin = 1 + torch.std(distance).item()
+        loss = (1 - labels) * distance.pow(2) + labels * relu(margin - distance).pow(2)
+        return loss.mean()
+
+    def load_from(self, weights):
+        with torch.no_grad():
+            if self.zero_head:
+                nn.init.zeros_(self.head.weight)
+                nn.init.zeros_(self.head.bias)
+                logger.info("head is initialized with zero")
+            else:
+                self.head.weight.copy_(np2th(weights["head/kernel"]).t())
+                self.head.bias.copy_(np2th(weights["head/bias"]).t())
+
+        self.load_weights1(weights=weights)
+        self.load_weights2(weights=weights)
+
+    def load_weights1(self, weights):
+        with torch.no_grad():
+            self.transformer1.embeddings.patch_embeddings.weight.copy_(np2th(weights["embedding/kernel"], conv=True))
+            self.transformer1.embeddings.patch_embeddings.bias.copy_(np2th(weights["embedding/bias"]))
+            self.transformer1.embeddings.cls_token.copy_(np2th(weights["cls"]))
+            self.transformer1.encoder.encoder_norm.weight.copy_(np2th(weights["Transformer/encoder_norm/scale"]))
+            self.transformer1.encoder.encoder_norm.bias.copy_(np2th(weights["Transformer/encoder_norm/bias"]))
+
+            posemb = np2th(weights["Transformer/posembed_input/pos_embedding"])
+            posemb_new = self.transformer1.embeddings.position_embeddings
+            if posemb.size() == posemb_new.size():
+                self.transformer1.embeddings.position_embeddings.copy_(posemb)
+                logger.info(f'load_pretrained: transformer1: {posemb.shape}')
+            else:
+                logger.info("load_pretrained: resized variant: %s to %s" % (posemb.size(), posemb_new.size()))
+                ntok_new = posemb_new.size(1)
+
+                if self.classifier == "token":
+                    posemb_tok, posemb_grid = posemb[:, :1], posemb[0, 1:]
+                    ntok_new -= 1
+                else:
+                    posemb_tok, posemb_grid = posemb[:, :0], posemb[0]
+
+                gs_old = int(np.sqrt(len(posemb_grid)))
+                gs_new = int(np.sqrt(ntok_new))
+                print('load_pretrained: grid-size from %s to %s' % (gs_old, gs_new))
+                posemb_grid = posemb_grid.reshape(gs_old, gs_old, -1)
+
+                zoom = (gs_new / gs_old, gs_new / gs_old, 1)
+                posemb_grid = ndimage.zoom(posemb_grid, zoom, order=1)
+                posemb_grid = posemb_grid.reshape(1, gs_new * gs_new, -1)
+                posemb = np.concatenate([posemb_tok, posemb_grid], axis=1)
+                self.transformer1.embeddings.position_embeddings.copy_(np2th(posemb))
+
+            for bname, block in self.transformer1.encoder.named_children():
+                for uname, unit in block.named_children():
+                    unit.load_from(weights, n_block=uname)
+            logger.info("regular model is loaded in transformer1")
+
+            if self.transformer1.embeddings.hybrid:
+                self.transformer1.embeddings.hybrid_model.root.conv.weight.copy_(
+                    np2th(weights["conv_root/kernel"], conv=True))
+                gn_weight = np2th(weights["gn_root/scale"]).view(-1)
+                gn_bias = np2th(weights["gn_root/bias"]).view(-1)
+                self.transformer1.embeddings.hybrid_model.root.gn.weight.copy_(gn_weight)
+                self.transformer1.embeddings.hybrid_model.root.gn.bias.copy_(gn_bias)
+
+                for bname, block in self.transformer1.embeddings.hybrid_model.body.named_children():
+                    for uname, unit in block.named_children():
+                        unit.load_from(weights, n_block=bname, n_unit=uname)
+                logger.info("hybrid model is loaded in transformer1")
+
+    def load_weights2(self, weights):
+        with torch.no_grad():
+            self.transformer2.embeddings.patch_embeddings.weight.copy_(np2th(weights["embedding/kernel"], conv=True))
+            self.transformer2.embeddings.patch_embeddings.bias.copy_(np2th(weights["embedding/bias"]))
+            self.transformer2.embeddings.cls_token.copy_(np2th(weights["cls"]))
+            self.transformer2.encoder.encoder_norm.weight.copy_(np2th(weights["Transformer/encoder_norm/scale"]))
+            self.transformer2.encoder.encoder_norm.bias.copy_(np2th(weights["Transformer/encoder_norm/bias"]))
+
+            posemb = np2th(weights["Transformer/posembed_input/pos_embedding"])
+            posemb_new = self.transformer2.embeddings.position_embeddings
+            if posemb.size() == posemb_new.size():
+                self.transformer2.embeddings.position_embeddings.copy_(posemb)
+                logger.info(f'load_pretrained: transformer2: {posemb.shape}')
+            else:
+                logger.info("load_pretrained: resized variant: %s to %s" % (posemb.size(), posemb_new.size()))
+                ntok_new = posemb_new.size(1)
+
+                if self.classifier == "token":
+                    posemb_tok, posemb_grid = posemb[:, :1], posemb[0, 1:]
+                    ntok_new -= 1
+                else:
+                    posemb_tok, posemb_grid = posemb[:, :0], posemb[0]
+
+                gs_old = int(np.sqrt(len(posemb_grid)))
+                gs_new = int(np.sqrt(ntok_new))
+                print('load_pretrained: grid-size from %s to %s' % (gs_old, gs_new))
+                posemb_grid = posemb_grid.reshape(gs_old, gs_old, -1)
+
+                zoom = (gs_new / gs_old, gs_new / gs_old, 1)
+                posemb_grid = ndimage.zoom(posemb_grid, zoom, order=1)
+                posemb_grid = posemb_grid.reshape(1, gs_new * gs_new, -1)
+                posemb = np.concatenate([posemb_tok, posemb_grid], axis=1)
+                self.transformer2.embeddings.position_embeddings.copy_(np2th(posemb))
+
+            for bname, block in self.transformer2.encoder.named_children():
+                for uname, unit in block.named_children():
+                    unit.load_from(weights, n_block=uname)
+            logger.info("regular model is loaded in transformer2")
+
+            if self.transformer2.embeddings.hybrid:
+                self.transformer2.embeddings.hybrid_model.root.conv.weight.copy_(
+                    np2th(weights["conv_root/kernel"], conv=True))
+                gn_weight = np2th(weights["gn_root/scale"]).view(-1)
+                gn_bias = np2th(weights["gn_root/bias"]).view(-1)
+                self.transformer2.embeddings.hybrid_model.root.gn.weight.copy_(gn_weight)
+                self.transformer2.embeddings.hybrid_model.root.gn.bias.copy_(gn_bias)
+
+                for bname, block in self.transformer2.embeddings.hybrid_model.body.named_children():
+                    for uname, unit in block.named_children():
+                        unit.load_from(weights, n_block=bname, n_unit=uname)
+                logger.info("hybrid model is loaded in transformer2")
+
+
+class MultiViT(nn.Module):
+    def __init__(self, config, res_type, num_classes1, num_classes2,
+                 img_size=224, zero_head=False, vis=False):
+        super(MultiViT, self).__init__()
+        self.num_classes1 = num_classes1
+        self.num_classes2 = num_classes2
+        self.zero_head = zero_head
+        self.classifier = config.classifier
+
+        self.transformer1 = Transformer(config, img_size, vis)
+        self.transformer2 = Transformer(config, img_size, vis)
+
+        self.neck = Linear(config.hidden_size * 2, config.hidden_size)
+        self.head1 = Linear(config.hidden_size, num_classes1)
+        self.head2 = Linear(config.hidden_size, num_classes2)
+
+        self.cls_loss = CrossEntropyLoss()
+        self.mse_loss = MSELoss()
+        self.res_type = res_type
+        print(f'using {res_type} loss')
+
+    def forward(self, x1, x2, labels1=None, labels2=None):
+        x1 = self.transformer1(x1)[0][:, 0]
+        x2 = self.transformer2(x2)[0][:, 0]
+        x = torch.cat((x1, x2), dim=-1)
+
+        x = self.neck(x)
+        logits1, logits2 = self.head1(x), self.head2(x)
+
+        if labels1 is not None:
+            cls_loss1 = self.cls_loss(logits1.view(-1, self.num_classes1), labels1.view(-1))
+            cls_loss2 = self.cls_loss(logits2.view(-1, self.num_classes2), labels2.view(-1))
+
+            res_loss = self.mse_loss(x1, x2)
+
+            loss = cls_loss1 + cls_loss2 + res_loss
+            return loss, logits1, logits2
+
+        else:
+            return logits1, logits2
+
+    def load_from(self, weights):
+        with torch.no_grad():
+            if self.zero_head:
+                nn.init.zeros_(self.head1.weight), nn.init.zeros_(self.head1.bias)
+                logger.info("head1 is initialized with zero")
+
+                nn.init.zeros_(self.head2.weight), nn.init.zeros_(self.head2.bias)
+                logger.info("head2 is initialized with zero")
+
+            else:
+                self.head1.weight.copy_(np2th(weights["head/kernel"]).t())
+                self.head1.bias.copy_(np2th(weights["head/bias"]).t())
+
+                self.head2.weight.copy_(np2th(weights["head/kernel"]).t())
+                self.head2.bias.copy_(np2th(weights["head/bias"]).t())
+
+            self.load_weights1(weights=weights)
+            self.load_weights2(weights=weights)
+
+    def load_weights1(self, weights):
+        self.transformer1.embeddings.patch_embeddings.weight.copy_(np2th(weights["embedding/kernel"], conv=True))
+        self.transformer1.embeddings.patch_embeddings.bias.copy_(np2th(weights["embedding/bias"]))
+        self.transformer1.embeddings.cls_token.copy_(np2th(weights["cls"]))
+        self.transformer1.encoder.encoder_norm.weight.copy_(np2th(weights["Transformer/encoder_norm/scale"]))
+        self.transformer1.encoder.encoder_norm.bias.copy_(np2th(weights["Transformer/encoder_norm/bias"]))
+
+        posemb = np2th(weights["Transformer/posembed_input/pos_embedding"])
+        posemb_new = self.transformer1.embeddings.position_embeddings
+        if posemb.size() == posemb_new.size():
+            self.transformer1.embeddings.position_embeddings.copy_(posemb)
+            logger.info(f'load_pretrained: transformer1: {posemb.shape}')
+        else:
+            logger.info("load_pretrained: resized variant: %s to %s" % (posemb.size(), posemb_new.size()))
+            ntok_new = posemb_new.size(1)
+
+            if self.classifier == "token":
+                posemb_tok, posemb_grid = posemb[:, :1], posemb[0, 1:]
+                ntok_new -= 1
+            else:
+                posemb_tok, posemb_grid = posemb[:, :0], posemb[0]
+
+            gs_old = int(np.sqrt(len(posemb_grid)))
+            gs_new = int(np.sqrt(ntok_new))
+            print('load_pretrained: grid-size from %s to %s' % (gs_old, gs_new))
+            posemb_grid = posemb_grid.reshape(gs_old, gs_old, -1)
+
+            zoom = (gs_new / gs_old, gs_new / gs_old, 1)
+            posemb_grid = ndimage.zoom(posemb_grid, zoom, order=1)
+            posemb_grid = posemb_grid.reshape(1, gs_new * gs_new, -1)
+            posemb = np.concatenate([posemb_tok, posemb_grid], axis=1)
+            self.transformer1.embeddings.position_embeddings.copy_(np2th(posemb))
+
+        for bname, block in self.transformer1.encoder.named_children():
+            for uname, unit in block.named_children():
+                unit.load_from(weights, n_block=uname)
+        logger.info("regular model is loaded in transformer1")
+
+        if self.transformer1.embeddings.hybrid:
+            self.transformer1.embeddings.hybrid_model.root.conv.weight.copy_(
+                np2th(weights["conv_root/kernel"], conv=True))
+            gn_weight = np2th(weights["gn_root/scale"]).view(-1)
+            gn_bias = np2th(weights["gn_root/bias"]).view(-1)
+            self.transformer1.embeddings.hybrid_model.root.gn.weight.copy_(gn_weight)
+            self.transformer1.embeddings.hybrid_model.root.gn.bias.copy_(gn_bias)
+
+            for bname, block in self.transformer1.embeddings.hybrid_model.body.named_children():
+                for uname, unit in block.named_children():
+                    unit.load_from(weights, n_block=bname, n_unit=uname)
+            logger.info("hybrid model is loaded in transformer1")
+
+    def load_weights2(self, weights):
+        self.transformer2.embeddings.patch_embeddings.weight.copy_(np2th(weights["embedding/kernel"], conv=True))
+        self.transformer2.embeddings.patch_embeddings.bias.copy_(np2th(weights["embedding/bias"]))
+        self.transformer2.embeddings.cls_token.copy_(np2th(weights["cls"]))
+        self.transformer2.encoder.encoder_norm.weight.copy_(np2th(weights["Transformer/encoder_norm/scale"]))
+        self.transformer2.encoder.encoder_norm.bias.copy_(np2th(weights["Transformer/encoder_norm/bias"]))
+
+        posemb = np2th(weights["Transformer/posembed_input/pos_embedding"])
+        posemb_new = self.transformer2.embeddings.position_embeddings
+        if posemb.size() == posemb_new.size():
+            self.transformer2.embeddings.position_embeddings.copy_(posemb)
+            logger.info(f'load_pretrained: transformer2: {posemb.shape}')
+        else:
+            logger.info("load_pretrained: resized variant: %s to %s" % (posemb.size(), posemb_new.size()))
+            ntok_new = posemb_new.size(1)
+
+            if self.classifier == "token":
+                posemb_tok, posemb_grid = posemb[:, :1], posemb[0, 1:]
+                ntok_new -= 1
+            else:
+                posemb_tok, posemb_grid = posemb[:, :0], posemb[0]
+
+            gs_old = int(np.sqrt(len(posemb_grid)))
+            gs_new = int(np.sqrt(ntok_new))
+            print('load_pretrained: grid-size from %s to %s' % (gs_old, gs_new))
+            posemb_grid = posemb_grid.reshape(gs_old, gs_old, -1)
+
+            zoom = (gs_new / gs_old, gs_new / gs_old, 1)
+            posemb_grid = ndimage.zoom(posemb_grid, zoom, order=1)
+            posemb_grid = posemb_grid.reshape(1, gs_new * gs_new, -1)
+            posemb = np.concatenate([posemb_tok, posemb_grid], axis=1)
+            self.transformer2.embeddings.position_embeddings.copy_(np2th(posemb))
+
+        for bname, block in self.transformer2.encoder.named_children():
+            for uname, unit in block.named_children():
+                unit.load_from(weights, n_block=uname)
+        logger.info("regular model is loaded in transformer2")
+
+        if self.transformer2.embeddings.hybrid:
+            self.transformer2.embeddings.hybrid_model.root.conv.weight.copy_(
+                np2th(weights["conv_root/kernel"], conv=True))
+            gn_weight = np2th(weights["gn_root/scale"]).view(-1)
+            gn_bias = np2th(weights["gn_root/bias"]).view(-1)
+            self.transformer2.embeddings.hybrid_model.root.gn.weight.copy_(gn_weight)
+            self.transformer2.embeddings.hybrid_model.root.gn.bias.copy_(gn_bias)
+
+            for bname, block in self.transformer2.embeddings.hybrid_model.body.named_children():
+                for uname, unit in block.named_children():
+                    unit.load_from(weights, n_block=bname, n_unit=uname)
+            logger.info("hybrid model is loaded in transformer2")
+
 
 CONFIGS = {
     'ViT-B_16': configs.get_b16_config(),
@@ -342,6 +832,7 @@ CONFIGS = {
     'ViT-L_16': configs.get_l16_config(),
     'ViT-L_32': configs.get_l32_config(),
     'ViT-H_14': configs.get_h14_config(),
+    'R50': configs.get_r50_config(),
     'R50-ViT-B_16': configs.get_r50_b16_config(),
     'testing': configs.get_testing(),
 }

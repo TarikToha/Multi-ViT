@@ -14,15 +14,17 @@
 
 # Lint as: python3
 """Bottleneck ResNet v2 with GroupNorm and Weight Standardization."""
-import math
-
-from os.path import join as pjoin
-
+import logging
 from collections import OrderedDict  # pylint: disable=g-importing-member
+from os.path import join as pjoin
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn import CrossEntropyLoss, Linear
+from torchvision import models
+
+logger = logging.getLogger(__name__)
 
 
 def np2th(weights, conv=False):
@@ -59,7 +61,7 @@ class PreActBottleneck(nn.Module):
     def __init__(self, cin, cout=None, cmid=None, stride=1):
         super().__init__()
         cout = cout or cin
-        cmid = cmid or cout//4
+        cmid = cmid or cout // 4
 
         self.gn1 = nn.GroupNorm(32, cmid, eps=1e-6)
         self.conv1 = conv1x1(cin, cmid, bias=False)
@@ -126,6 +128,7 @@ class PreActBottleneck(nn.Module):
             self.gn_proj.weight.copy_(proj_gn_weight.view(-1))
             self.gn_proj.bias.copy_(proj_gn_bias.view(-1))
 
+
 class ResNetV2(nn.Module):
     """Implementation of Pre-activation (v2) ResNet mode."""
 
@@ -145,20 +148,98 @@ class ResNetV2(nn.Module):
 
         self.body = nn.Sequential(OrderedDict([
             ('block1', nn.Sequential(OrderedDict(
-                [('unit1', PreActBottleneck(cin=width, cout=width*4, cmid=width))] +
-                [(f'unit{i:d}', PreActBottleneck(cin=width*4, cout=width*4, cmid=width)) for i in range(2, block_units[0] + 1)],
-                ))),
+                [('unit1', PreActBottleneck(cin=width, cout=width * 4, cmid=width))] +
+                [(f'unit{i:d}', PreActBottleneck(cin=width * 4, cout=width * 4, cmid=width)) for i in
+                 range(2, block_units[0] + 1)],
+            ))),
             ('block2', nn.Sequential(OrderedDict(
-                [('unit1', PreActBottleneck(cin=width*4, cout=width*8, cmid=width*2, stride=2))] +
-                [(f'unit{i:d}', PreActBottleneck(cin=width*8, cout=width*8, cmid=width*2)) for i in range(2, block_units[1] + 1)],
-                ))),    
+                [('unit1', PreActBottleneck(cin=width * 4, cout=width * 8, cmid=width * 2, stride=2))] +
+                [(f'unit{i:d}', PreActBottleneck(cin=width * 8, cout=width * 8, cmid=width * 2)) for i in
+                 range(2, block_units[1] + 1)],
+            ))),
             ('block3', nn.Sequential(OrderedDict(
-                [('unit1', PreActBottleneck(cin=width*8, cout=width*16, cmid=width*4, stride=2))] +
-                [(f'unit{i:d}', PreActBottleneck(cin=width*16, cout=width*16, cmid=width*4)) for i in range(2, block_units[2] + 1)],
-                ))),
+                [('unit1', PreActBottleneck(cin=width * 8, cout=width * 16, cmid=width * 4, stride=2))] +
+                [(f'unit{i:d}', PreActBottleneck(cin=width * 16, cout=width * 16, cmid=width * 4)) for i in
+                 range(2, block_units[2] + 1)],
+            ))),
         ]))
 
     def forward(self, x):
         x = self.root(x)
         x = self.body(x)
         return x
+
+
+class BiResNet(nn.Module):
+    def __init__(self, num_classes):
+        super(BiResNet, self).__init__()
+        self.num_classes = num_classes
+
+        self.branch1 = models.resnet18(weights=None).cuda()
+        self.branch1.fc = nn.Identity()  # Remove classification head
+
+        self.branch2 = models.resnet18(weights=None).cuda()
+        self.branch2.fc = nn.Identity()  # Remove classification head
+
+        self.head = Linear(512 * 2, num_classes)
+        self.cls_loss = CrossEntropyLoss()
+
+    def forward(self, x1, x2, labels=None):
+        x1 = self.branch1(x1)
+        x2 = self.branch2(x2)
+
+        x = torch.cat((x1, x2), dim=-1)
+        logits = self.head(x)
+
+        if labels is not None:
+            loss = self.cls_loss(logits.view(-1, self.num_classes), labels.view(-1))
+            return loss, logits
+        else:
+            return logits
+
+    def load_from(self, weights):
+        pass
+
+
+class UniResNet(nn.Module):
+    def __init__(self, num_classes):
+        super(UniResNet, self).__init__()
+        self.num_classes = num_classes
+
+        self.model = models.resnet18(weights=None).cuda()
+        self.model.fc = Linear(512, num_classes)
+        self.cls_loss = CrossEntropyLoss()
+
+    def forward(self, x, labels=None):
+        logits = self.model(x)
+
+        if labels is not None:
+            loss = self.cls_loss(logits.view(-1, self.num_classes), labels.view(-1))
+            return loss, logits
+        else:
+            return logits
+
+    def load_from(self, weights):
+        pass
+
+
+class UniVGGNet(nn.Module):
+    def __init__(self, num_classes):
+        super(UniVGGNet, self).__init__()
+        self.num_classes = num_classes
+
+        self.model = models.vgg11(weights=None).cuda()
+        self.model.classifier[6] = Linear(4096, num_classes)
+        self.cls_loss = CrossEntropyLoss()
+
+    def forward(self, x, labels=None):
+        logits = self.model(x)
+
+        if labels is not None:
+            loss = self.cls_loss(logits.view(-1, self.num_classes), labels.view(-1))
+            return loss, logits
+        else:
+            return logits
+
+    def load_from(self, weights):
+        pass
